@@ -1,0 +1,128 @@
+name: deploy-backend-lambda
+description: Build and deploy a Python Lambda package to AWS.
+
+inputs:
+  code_dir:
+    description: Relative path to the Lambda source directory.
+    required: true
+  product:
+    description: Product prefix used in Lambda function naming.
+    required: true
+  aws_region:
+    description: AWS region for deployment.
+    required: true
+  aws_role_arn:
+    description: IAM role ARN assumed via OIDC.
+    required: true
+  artifact_bucket:
+    description: S3 bucket for Lambda artifacts.
+    required: true
+  python_version:
+    description: Python version for the build environment.
+    required: false
+    default: "3.12"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python_version }}
+
+    - name: Verify inputs
+      shell: bash
+      env:
+        PRODUCT: ${{ inputs.product }}
+        ARTIFACT_BUCKET: ${{ inputs.artifact_bucket }}
+        CODE_DIR: ${{ inputs.code_dir }}
+        AWS_ROLE_ARN: ${{ inputs.aws_role_arn }}
+      run: |
+        set -euo pipefail
+        if [ -z "$PRODUCT" ]; then
+          echo "product input is required" >&2
+          exit 1
+        fi
+        if [ -z "$ARTIFACT_BUCKET" ]; then
+          echo "artifact_bucket input is required" >&2
+          exit 1
+        fi
+        if [ -z "$AWS_ROLE_ARN" ]; then
+          echo "aws_role_arn input is required" >&2
+          exit 1
+        fi
+        if [ ! -d "$CODE_DIR" ]; then
+          echo "code_dir '$CODE_DIR' does not exist" >&2
+          exit 1
+        fi
+
+    - name: Build package
+      shell: bash
+      env:
+        CODE_DIR: ${{ inputs.code_dir }}
+      run: |
+        set -euo pipefail
+        BUILD_ROOT=".build/${CODE_DIR}"
+        ZIP_PATH=".build/${CODE_DIR}.zip"
+        rm -rf "$BUILD_ROOT" "$ZIP_PATH"
+        mkdir -p "$BUILD_ROOT"
+        if [ -f "$CODE_DIR/requirements.txt" ]; then
+          pip install -r "$CODE_DIR/requirements.txt" -t "$BUILD_ROOT"
+        fi
+        if [ -d "common" ]; then
+          rsync -a --exclude '__pycache__' common "$BUILD_ROOT/"
+        fi
+        rsync -a --exclude '__pycache__' "$CODE_DIR/" "$BUILD_ROOT/"
+        (cd "$BUILD_ROOT" && zip -r "../${CODE_DIR}.zip" .)
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ inputs.aws_role_arn }}
+        aws-region: ${{ inputs.aws_region }}
+
+    - name: Upload artifact to S3
+      shell: bash
+      env:
+        ARTIFACT_BUCKET: ${{ inputs.artifact_bucket }}
+        PRODUCT: ${{ inputs.product }}
+        ZIP_PATH: .build/${{ inputs.code_dir }}.zip
+        CODE_DIR: ${{ inputs.code_dir }}
+      run: |
+        set -euo pipefail
+        if [ -z "$ARTIFACT_BUCKET" ]; then
+          echo "Artifact bucket is required." >&2
+          exit 1
+        fi
+        if [ -z "$ZIP_PATH" ] || [ ! -f "$ZIP_PATH" ]; then
+          echo "Zip file '$ZIP_PATH' was not created." >&2
+          exit 1
+        fi
+        suffix="$CODE_DIR"
+        KEY="lambda/${suffix}/${GITHUB_SHA}.zip"
+        FUNC_NAME="${suffix}"
+        aws s3 cp "$ZIP_PATH" "s3://$ARTIFACT_BUCKET/$KEY"
+        {
+          echo "ARTIFACT_BUCKET=$ARTIFACT_BUCKET"
+          echo "ARTIFACT_KEY=$KEY"
+          echo "FUNCTION_NAME=$FUNC_NAME"
+        } >> "$GITHUB_ENV"
+
+    - name: Update Lambda → Publish → Alias switch
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [ -z "${FUNCTION_NAME:-}" ]; then
+          echo "FUNCTION_NAME is not set." >&2
+          exit 1
+        fi
+        if [ -z "${ARTIFACT_BUCKET:-}" ] || [ -z "${ARTIFACT_KEY:-}" ]; then
+          echo "Artifact location is not set." >&2
+          exit 1
+        fi
+        aws lambda update-function-code --function-name "$FUNCTION_NAME" --s3-bucket "$ARTIFACT_BUCKET" --s3-key "$ARTIFACT_KEY"
+        aws lambda wait function-updated --function-name "$FUNCTION_NAME"
+        VER=$(aws lambda publish-version --function-name "$FUNCTION_NAME" --query Version --output text)
+        if ! aws lambda update-alias --function-name "$FUNCTION_NAME" --name live --function-version "$VER"; then
+          aws lambda create-alias --function-name "$FUNCTION_NAME" --name live --function-version "$VER"
+        fi

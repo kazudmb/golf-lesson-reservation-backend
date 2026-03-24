@@ -1,0 +1,43 @@
+# macOS artifacts
+.DS_Store
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.env
+.python-version
+
+# Package/build outputs
+build/
+dist/
+.build/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Test and coverage reports
+.pytest_cache/
+.mypy_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Tool caches and logs
+.cache/
+*.log
+
+# IDE/project settings
+.idea/
+.vscode/
+
+# Lambda/SAM artifacts
+build.zip
+.aws-sam/
+.serverless/

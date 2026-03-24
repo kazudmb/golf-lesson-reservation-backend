@@ -1,0 +1,94 @@
+name: backend-deploy
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    types: [closed]
+    branches:
+      - stg
+      - prd
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    strategy:
+      matrix:
+        env:
+          - name: dev
+          - name: stg
+          - name: prd
+        function:
+          - auto_reserve_lesson
+      fail-fast: false
+    environment: ${{ matrix.env.name }}
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'ap-northeast-1' }}
+      PRODUCT: ${{ vars.PRODUCT }}
+
+    steps:
+      - name: Detect branch env
+        id: detect_env
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.event.pull_request.base.ref || '' }}
+        run: |
+          if [ "${EVENT_NAME}" = "workflow_dispatch" ]; then
+            target_ref="main"
+          elif [ "${EVENT_NAME}" = "pull_request" ]; then
+            target_ref="${BASE_REF}"
+          else
+            target_ref="${REF_NAME}"
+          fi
+
+          case "${target_ref}" in
+            main) echo "branch_env=dev" >> "$GITHUB_OUTPUT" ;;
+            stg) echo "branch_env=stg" >> "$GITHUB_OUTPUT" ;;
+            prd) echo "branch_env=prd" >> "$GITHUB_OUTPUT" ;;
+            *)
+              echo "branch_env=" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+
+      - name: Filter target env
+        id: filter
+        env:
+          BRANCH_ENV: ${{ steps.detect_env.outputs.branch_env || '' }}
+          MATRIX_ENV: ${{ matrix.env.name }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_MERGED: ${{ github.event.pull_request.merged || false }}
+        run: |
+          if [ "${EVENT_NAME}" = "pull_request" ] && [ "${PR_MERGED}" != "true" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ -n "$BRANCH_ENV" ]; then
+            if [ "$BRANCH_ENV" = "$MATRIX_ENV" ]; then
+              echo "run=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "run=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout
+        if: steps.filter.outputs.run == 'true'
+        uses: actions/checkout@v4
+
+      - name: Deploy backend Lambda
+        if: steps.filter.outputs.run == 'true'
+        uses: ./.github/actions/deploy-backend
+        with:
+          code_dir: ${{ matrix.function }}
+          product: ${{ env.PRODUCT }}
+          aws_region: ${{ env.AWS_REGION }}
+          aws_role_arn: ${{ secrets.AWS_ROLE_ARN }}
+          artifact_bucket: ${{ secrets.ARTIFACT_BUCKET }}
+          python_version: "3.12"

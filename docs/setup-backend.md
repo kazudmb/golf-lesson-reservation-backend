@@ -5,5 +5,5 @@
 - GitHub Variables `(dev)` に保存
   - `PRODUCT`: `<project>`
   - `AWS_REGION`: `ap-northeast-1`
-- メモ
-  - Actions に Lambda のファイル名を記述しないとエラーになる
+- AWS Secrets Manager に保存
+  - `auto-reserve-lesson/credentials`: `{"LESSON_MEMBER_ID":"...","LESSON_PASSWORD":"..."}`

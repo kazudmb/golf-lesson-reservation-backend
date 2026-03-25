@@ -9,9 +9,11 @@ from typing import Any
 from urllib.parse import urljoin
 from zoneinfo import ZoneInfo
 
+import boto3
 import jpholiday
 import requests
 from bs4 import BeautifulSoup, Tag
+from botocore.exceptions import BotoCoreError, ClientError
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -21,6 +23,7 @@ logger.setLevel(logging.INFO)
 
 LOCAL_TZ = ZoneInfo("Asia/Tokyo")
 CALENDAR_SCOPE = "https://www.googleapis.com/auth/calendar.readonly"
+DEFAULT_CREDENTIALS_SECRET_ID = "auto-reserve-lesson/credentials"
 
 DATE_REGEX = re.compile(
     r"(?:(?P<y>\d{4})[/.年-])?(?P<m>\d{1,2})[/.月-](?P<d>\d{1,2})日?"
@@ -102,6 +105,53 @@ def _parse_hhmm(value: str, *, name: str) -> time:
     return parsed.time()
 
 
+def _load_secret_credentials(secret_id: str) -> tuple[str, str]:
+    client = boto3.client("secretsmanager")
+
+    try:
+        response = client.get_secret_value(SecretId=secret_id)
+    except (BotoCoreError, ClientError) as exc:
+        raise ReservationAutomationError(
+            f"Failed to load lesson credentials from Secrets Manager: {secret_id}"
+        ) from exc
+
+    secret_string = response.get("SecretString")
+    if secret_string:
+        raw_secret = secret_string
+    else:
+        secret_binary = response.get("SecretBinary")
+        if not secret_binary:
+            raise ReservationAutomationError(
+                f"Secrets Manager secret is empty: {secret_id}"
+            )
+        try:
+            raw_secret = base64.b64decode(secret_binary).decode("utf-8")
+        except Exception as exc:
+            raise ReservationAutomationError(
+                f"Secrets Manager secret could not be decoded: {secret_id}"
+            ) from exc
+
+    try:
+        secret_payload = json.loads(raw_secret)
+    except json.JSONDecodeError as exc:
+        raise ReservationAutomationError(
+            f"Secrets Manager secret must be valid JSON: {secret_id}"
+        ) from exc
+
+    member_id = str(secret_payload.get("LESSON_MEMBER_ID") or "").strip()
+    password = str(secret_payload.get("LESSON_PASSWORD") or "").strip()
+    if not member_id:
+        raise ReservationAutomationError(
+            f"LESSON_MEMBER_ID is missing in Secrets Manager secret: {secret_id}"
+        )
+    if not password:
+        raise ReservationAutomationError(
+            f"LESSON_PASSWORD is missing in Secrets Manager secret: {secret_id}"
+        )
+
+    return member_id, password
+
+
 def _load_settings(event: dict[str, Any] | None = None) -> Settings:
     payload = event if isinstance(event, dict) else {}
 
@@ -109,12 +159,15 @@ def _load_settings(event: dict[str, Any] | None = None) -> Settings:
     if not site_url:
         site_url = "https://www.spoon3.jp/reserve/index.php?_action=index&site=smart&s=380"
 
-    member_id = str(payload.get("memberId") or os.getenv("LESSON_MEMBER_ID") or "").strip()
-    password = str(payload.get("password") or os.getenv("LESSON_PASSWORD") or "").strip()
-    if not member_id:
-        raise ReservationAutomationError("LESSON_MEMBER_ID is required")
-    if not password:
-        raise ReservationAutomationError("LESSON_PASSWORD is required")
+    member_id = str(payload.get("memberId") or "").strip()
+    password = str(payload.get("password") or "").strip()
+    if not member_id or not password:
+        credentials_secret_id = str(
+            payload.get("credentialsSecretId")
+            or os.getenv("LESSON_CREDENTIALS_SECRET_ID")
+            or DEFAULT_CREDENTIALS_SECRET_ID
+        ).strip()
+        member_id, password = _load_secret_credentials(credentials_secret_id)
 
     seat_label = str(
         payload.get("seatLabel") or os.getenv("LESSON_SEAT_LABEL") or "ジートラック打席"

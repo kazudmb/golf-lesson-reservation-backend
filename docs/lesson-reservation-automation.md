@@ -12,9 +12,14 @@
 - Lambda コード: `auto_reserve_lesson/main.py`
 - 依存関係: `auto_reserve_lesson/requirements.txt`
 
-## 必須環境変数
-- `LESSON_MEMBER_ID`: 会員番号
-- `LESSON_PASSWORD`: パスワード
+## 認証情報
+- 会員番号とパスワードは AWS Secrets Manager の `auto-reserve-lesson/credentials` に保存する
+- シークレットの JSON 例:
+  `{"LESSON_MEMBER_ID":"hoge","LESSON_PASSWORD":"hoge"}`
+
+### 任意の上書き
+- イベントペイロードに `memberId` / `password` を渡した場合は、その値を優先する
+- シークレット名を変えたい場合は `LESSON_CREDENTIALS_SECRET_ID` またはイベントペイロードの `credentialsSecretId` で上書きできる
 
 ## 任意環境変数
 - `LESSON_SITE_URL`

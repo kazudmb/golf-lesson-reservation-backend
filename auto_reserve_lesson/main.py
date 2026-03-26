@@ -110,7 +110,13 @@ def _load_secret_credentials(secret_id: str) -> tuple[str, str]:
 
     try:
         response = client.get_secret_value(SecretId=secret_id)
-    except (BotoCoreError, ClientError) as exc:
+    except ClientError as exc:
+        error = exc.response.get("Error", {})
+        error_code = error.get("Code", "Unknown")
+        raise ReservationAutomationError(
+            f"Failed to load lesson credentials from Secrets Manager: {secret_id} ({error_code})"
+        ) from exc
+    except BotoCoreError as exc:
         raise ReservationAutomationError(
             f"Failed to load lesson credentials from Secrets Manager: {secret_id}"
         ) from exc
@@ -457,9 +463,43 @@ class ReservationClient:
                 return form
         return None
 
+    def _find_member_field_tag(self, form: Tag) -> Tag | None:
+        fallback: Tag | None = None
+
+        for input_tag in form.find_all("input"):
+            if not isinstance(input_tag, Tag):
+                continue
+            if input_tag.has_attr("disabled"):
+                continue
+
+            input_type = str(input_tag.get("type") or "text").lower()
+            if input_type not in {"text", "tel", "number", "email", "search"}:
+                continue
+
+            name = str(input_tag.get("name") or "").strip()
+            placeholder = str(input_tag.get("placeholder") or "")
+            autocomplete = str(input_tag.get("autocomplete") or "").lower()
+            if name and fallback is None:
+                fallback = input_tag
+
+            if autocomplete == "username":
+                return input_tag
+            if any(key in name.lower() for key in ["member", "kaiin", "customer", "login", "id", "no"]):
+                return input_tag
+            if "会員" in placeholder or "番号" in placeholder:
+                return input_tag
+
+        return fallback
+
     def _find_member_form(self, page: HtmlPage) -> Tag | None:
+        fallback_form: Tag | None = None
+
         for form in page.soup.find_all("form"):
             if form.find("input", {"type": "password"}):
+                continue
+
+            member_field = self._find_member_field_tag(form)
+            if member_field is None:
                 continue
 
             for input_tag in form.find_all("input"):
@@ -483,9 +523,19 @@ class ReservationClient:
             if "会員" in form_text and "番号" in form_text:
                 return form
 
-        return None
+            if fallback_form is None:
+                fallback_form = form
+
+        return fallback_form
 
     def _field_name(self, form: Tag, *, password: bool = False) -> str:
+        if not password:
+            member_field = self._find_member_field_tag(form)
+            if member_field is not None:
+                name = str(member_field.get("name") or "").strip()
+                if name:
+                    return name
+
         for input_tag in form.find_all("input"):
             if not isinstance(input_tag, Tag):
                 continue

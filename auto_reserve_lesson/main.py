@@ -1,7 +1,6 @@
 import base64
 import json
 import logging
-import os
 import re
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
@@ -24,7 +23,13 @@ logger.setLevel(logging.INFO)
 LOCAL_TZ = ZoneInfo("Asia/Tokyo")
 CALENDAR_SCOPE = "https://www.googleapis.com/auth/calendar.freebusy"
 CALENDAR_CONFLICT_START_TIME = time(17, 0)
+DEFAULT_SITE_URL = "https://www.spoon3.jp/reserve/index.php?_action=index&site=smart&s=380"
 DEFAULT_CREDENTIALS_SECRET_ID = "auto-reserve-lesson/credentials"
+DEFAULT_SEAT_LABEL = "ジートラック打席"
+DEFAULT_MIN_SLOT_TIME = time(18, 40)
+DEFAULT_POLLING_START_HOUR = 0
+DEFAULT_POLLING_END_HOUR = 18
+DEFAULT_REQUEST_TIMEOUT_SECONDS = 20
 
 DATE_REGEX = re.compile(
     r"(?:(?P<y>\d{4})[/.年-])?(?P<m>\d{1,2})[/.月-](?P<d>\d{1,2})日?"
@@ -46,7 +51,6 @@ class Settings:
     polling_start_hour: int
     polling_end_hour: int
     request_timeout_seconds: int
-    dry_run: bool
     google_calendar_id: str | None
     google_service_account_json: str | None
 
@@ -90,20 +94,6 @@ def _response(status_code: int, body: dict[str, Any]):
         },
         "body": json.dumps(body, ensure_ascii=False),
     }
-
-
-def _parse_bool(value: str | None, *, default: bool = False) -> bool:
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _parse_hhmm(value: str, *, name: str) -> time:
-    try:
-        parsed = datetime.strptime(value, "%H:%M")
-    except ValueError as exc:
-        raise ReservationAutomationError(f"{name} must be HH:MM format") from exc
-    return parsed.time()
 
 
 def _load_secret_payload(secret_id: str) -> dict[str, Any]:
@@ -161,95 +151,30 @@ def _load_secret_credentials(secret_payload: dict[str, Any], *, secret_id: str) 
     return member_id, password
 
 
-def _load_settings(event: dict[str, Any] | None = None) -> Settings:
-    payload = event if isinstance(event, dict) else {}
-
-    site_url = str(payload.get("siteUrl") or os.getenv("LESSON_SITE_URL") or "").strip()
-    if not site_url:
-        site_url = "https://www.spoon3.jp/reserve/index.php?_action=index&site=smart&s=380"
-
-    credentials_secret_id = str(
-        payload.get("credentialsSecretId")
-        or os.getenv("LESSON_CREDENTIALS_SECRET_ID")
-        or DEFAULT_CREDENTIALS_SECRET_ID
-    ).strip()
-
-    member_id = str(payload.get("memberId") or "").strip()
-    password = str(payload.get("password") or "").strip()
-    credentials_secret_payload: dict[str, Any] | None = None
-    if not member_id or not password:
-        credentials_secret_payload = _load_secret_payload(credentials_secret_id)
-        member_id, password = _load_secret_credentials(
-            credentials_secret_payload,
-            secret_id=credentials_secret_id,
-        )
-
-    seat_label = str(
-        payload.get("seatLabel") or os.getenv("LESSON_SEAT_LABEL") or "ジートラック打席"
-    ).strip()
-    min_slot_time = _parse_hhmm(
-        str(payload.get("minSlotTime") or os.getenv("LESSON_MIN_SLOT_TIME") or "18:40"),
-        name="LESSON_MIN_SLOT_TIME",
+def _load_settings() -> Settings:
+    credentials_secret_id = DEFAULT_CREDENTIALS_SECRET_ID
+    credentials_secret_payload = _load_secret_payload(credentials_secret_id)
+    member_id, password = _load_secret_credentials(
+        credentials_secret_payload,
+        secret_id=credentials_secret_id,
     )
 
-    polling_start_hour = int(
-        str(payload.get("pollingStartHour") or os.getenv("LESSON_POLLING_START_HOUR") or "0")
+    google_calendar_id = (
+        str(credentials_secret_payload.get("GOOGLE_CALENDAR_ID") or "").strip() or None
     )
-    polling_end_hour = int(
-        str(payload.get("pollingEndHour") or os.getenv("LESSON_POLLING_END_HOUR") or "18")
+    google_service_account_json = (
+        str(credentials_secret_payload.get("GOOGLE_SERVICE_ACCOUNT_JSON") or "").strip() or None
     )
-    if polling_start_hour < 0 or polling_start_hour > 23:
-        raise ReservationAutomationError("LESSON_POLLING_START_HOUR must be between 0 and 23")
-    if polling_end_hour < 0 or polling_end_hour > 23:
-        raise ReservationAutomationError("LESSON_POLLING_END_HOUR must be between 0 and 23")
-    if polling_start_hour > polling_end_hour:
-        raise ReservationAutomationError(
-            "LESSON_POLLING_START_HOUR must be less than or equal to LESSON_POLLING_END_HOUR"
-        )
-
-    request_timeout_seconds = int(
-        str(payload.get("requestTimeoutSeconds") or os.getenv("LESSON_REQUEST_TIMEOUT_SECONDS") or "20")
-    )
-    if request_timeout_seconds <= 0:
-        raise ReservationAutomationError("LESSON_REQUEST_TIMEOUT_SECONDS must be positive")
-
-    dry_run = _parse_bool(
-        str(payload.get("dryRun") or os.getenv("LESSON_DRY_RUN") or "false"),
-        default=False,
-    )
-
-    google_calendar_id = str(
-        payload.get("googleCalendarId") or os.getenv("GOOGLE_CALENDAR_ID") or ""
-    ).strip() or None
-    google_service_account_json = str(
-        payload.get("googleServiceAccountJson") or os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON") or ""
-    ).strip() or None
-
-    google_secret_payload: dict[str, Any] | None = None
-    if not google_calendar_id or not google_service_account_json:
-        if credentials_secret_payload is not None:
-            google_secret_payload = credentials_secret_payload
-
-    if google_secret_payload is not None:
-        if not google_calendar_id:
-            google_calendar_id = (
-                str(google_secret_payload.get("GOOGLE_CALENDAR_ID") or "").strip() or None
-            )
-        if not google_service_account_json:
-            google_service_account_json = (
-                str(google_secret_payload.get("GOOGLE_SERVICE_ACCOUNT_JSON") or "").strip() or None
-            )
 
     return Settings(
-        site_url=site_url,
+        site_url=DEFAULT_SITE_URL,
         member_id=member_id,
         password=password,
-        seat_label=seat_label,
-        min_slot_time=min_slot_time,
-        polling_start_hour=polling_start_hour,
-        polling_end_hour=polling_end_hour,
-        request_timeout_seconds=request_timeout_seconds,
-        dry_run=dry_run,
+        seat_label=DEFAULT_SEAT_LABEL,
+        min_slot_time=DEFAULT_MIN_SLOT_TIME,
+        polling_start_hour=DEFAULT_POLLING_START_HOUR,
+        polling_end_hour=DEFAULT_POLLING_END_HOUR,
+        request_timeout_seconds=DEFAULT_REQUEST_TIMEOUT_SECONDS,
         google_calendar_id=google_calendar_id,
         google_service_account_json=google_service_account_json,
     )
@@ -1057,15 +982,6 @@ class ReservationAutomation:
             entry for entry in future_reservations if entry.cancel_action is None
         ]
 
-        if self.settings.dry_run:
-            return {
-                "status": "dry_run",
-                "date": today.isoformat(),
-                "chosenSlot": chosen_slot.reserved_time.strftime("%H:%M"),
-                "availableCount": chosen_slot.available_count,
-                "futureReservationCount": len(future_reservations),
-            }
-
         if non_cancellable_future:
             return {
                 "status": "skipped",
@@ -1100,7 +1016,7 @@ class ReservationAutomation:
 def handler(event, context):
     logger.info("Received event: %s", json.dumps(event, ensure_ascii=False, default=str))
     try:
-        settings = _load_settings(event if isinstance(event, dict) else None)
+        settings = _load_settings()
         automation = ReservationAutomation(settings)
         result = automation.run(now=datetime.now(LOCAL_TZ))
         return _response(200, result)

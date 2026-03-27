@@ -15,7 +15,7 @@
 ## 認証情報
 - 会員番号とパスワードは AWS Secrets Manager の `auto-reserve-lesson/credentials` に保存する
 - シークレットの JSON 例:
-  `{"LESSON_MEMBER_ID":"hoge","LESSON_PASSWORD":"hoge"}`
+  `{"LESSON_MEMBER_ID":"hoge","LESSON_PASSWORD":"hoge","GOOGLE_CALENDAR_ID":"your-calendar-id@group.calendar.google.com","GOOGLE_SERVICE_ACCOUNT_JSON":"{\"type\":\"service_account\",...}"}`
 
 ### 任意の上書き
 - イベントペイロードに `memberId` / `password` を渡した場合は、その値を優先する
@@ -40,6 +40,8 @@
 ### Google カレンダー連携（任意）
 - `GOOGLE_CALENDAR_ID`: 対象カレンダー ID
 - `GOOGLE_SERVICE_ACCOUNT_JSON`: サービスアカウント JSON（生 JSON 文字列 or base64）
+- Google カレンダーの予定詳細は読まず、その日の `busy` 情報だけで判定する
+- `busy` のうち、当日 `17:00` 以降の時間帯に重なるものだけを予約衝突として扱う
 
 ## スケジュール設定
 運用は EventBridge Scheduler か EventBridge ルールで毎時実行してください。

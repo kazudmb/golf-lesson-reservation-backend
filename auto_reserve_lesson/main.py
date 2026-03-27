@@ -22,7 +22,8 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 LOCAL_TZ = ZoneInfo("Asia/Tokyo")
-CALENDAR_SCOPE = "https://www.googleapis.com/auth/calendar.readonly"
+CALENDAR_SCOPE = "https://www.googleapis.com/auth/calendar.freebusy"
+CALENDAR_CONFLICT_START_TIME = time(17, 0)
 DEFAULT_CREDENTIALS_SECRET_ID = "auto-reserve-lesson/credentials"
 
 DATE_REGEX = re.compile(
@@ -105,7 +106,7 @@ def _parse_hhmm(value: str, *, name: str) -> time:
     return parsed.time()
 
 
-def _load_secret_credentials(secret_id: str) -> tuple[str, str]:
+def _load_secret_payload(secret_id: str) -> dict[str, Any]:
     client = boto3.client("secretsmanager")
 
     try:
@@ -138,12 +139,14 @@ def _load_secret_credentials(secret_id: str) -> tuple[str, str]:
             ) from exc
 
     try:
-        secret_payload = json.loads(raw_secret)
+        return json.loads(raw_secret)
     except json.JSONDecodeError as exc:
         raise ReservationAutomationError(
             f"Secrets Manager secret must be valid JSON: {secret_id}"
         ) from exc
 
+
+def _load_secret_credentials(secret_payload: dict[str, Any], *, secret_id: str) -> tuple[str, str]:
     member_id = str(secret_payload.get("LESSON_MEMBER_ID") or "").strip()
     password = str(secret_payload.get("LESSON_PASSWORD") or "").strip()
     if not member_id:
@@ -165,15 +168,21 @@ def _load_settings(event: dict[str, Any] | None = None) -> Settings:
     if not site_url:
         site_url = "https://www.spoon3.jp/reserve/index.php?_action=index&site=smart&s=380"
 
+    credentials_secret_id = str(
+        payload.get("credentialsSecretId")
+        or os.getenv("LESSON_CREDENTIALS_SECRET_ID")
+        or DEFAULT_CREDENTIALS_SECRET_ID
+    ).strip()
+
     member_id = str(payload.get("memberId") or "").strip()
     password = str(payload.get("password") or "").strip()
+    credentials_secret_payload: dict[str, Any] | None = None
     if not member_id or not password:
-        credentials_secret_id = str(
-            payload.get("credentialsSecretId")
-            or os.getenv("LESSON_CREDENTIALS_SECRET_ID")
-            or DEFAULT_CREDENTIALS_SECRET_ID
-        ).strip()
-        member_id, password = _load_secret_credentials(credentials_secret_id)
+        credentials_secret_payload = _load_secret_payload(credentials_secret_id)
+        member_id, password = _load_secret_credentials(
+            credentials_secret_payload,
+            secret_id=credentials_secret_id,
+        )
 
     seat_label = str(
         payload.get("seatLabel") or os.getenv("LESSON_SEAT_LABEL") or "ジートラック打席"
@@ -215,6 +224,21 @@ def _load_settings(event: dict[str, Any] | None = None) -> Settings:
     google_service_account_json = str(
         payload.get("googleServiceAccountJson") or os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON") or ""
     ).strip() or None
+
+    google_secret_payload: dict[str, Any] | None = None
+    if not google_calendar_id or not google_service_account_json:
+        if credentials_secret_payload is not None:
+            google_secret_payload = credentials_secret_payload
+
+    if google_secret_payload is not None:
+        if not google_calendar_id:
+            google_calendar_id = (
+                str(google_secret_payload.get("GOOGLE_CALENDAR_ID") or "").strip() or None
+            )
+        if not google_service_account_json:
+            google_service_account_json = (
+                str(google_secret_payload.get("GOOGLE_SERVICE_ACCOUNT_JSON") or "").strip() or None
+            )
 
     return Settings(
         site_url=site_url,
@@ -285,6 +309,39 @@ def _parse_service_account_info(raw_value: str) -> dict[str, Any]:
         ) from exc
 
 
+def _parse_google_datetime(raw_value: str) -> datetime:
+    normalized = raw_value.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError as exc:
+        raise ReservationAutomationError(
+            f"Google Calendar returned an invalid datetime: {raw_value}"
+        ) from exc
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=LOCAL_TZ)
+    return parsed.astimezone(LOCAL_TZ)
+
+
+def _busy_slot_overlaps_conflict_window(slot: dict[str, Any], *, target_day: date) -> bool:
+    start_value = str(slot.get("start") or "").strip()
+    end_value = str(slot.get("end") or "").strip()
+    if not start_value or not end_value:
+        return False
+
+    slot_start = _parse_google_datetime(start_value)
+    slot_end = _parse_google_datetime(end_value)
+    if slot_end <= slot_start:
+        return False
+
+    conflict_window_start = datetime.combine(
+        target_day, CALENDAR_CONFLICT_START_TIME, tzinfo=LOCAL_TZ
+    )
+    conflict_window_end = datetime.combine(
+        target_day + timedelta(days=1), time(0, 0), tzinfo=LOCAL_TZ
+    )
+    return slot_start < conflict_window_end and slot_end > conflict_window_start
+
+
 def _has_google_calendar_conflict(settings: Settings, target_day: date) -> bool:
     if not settings.google_calendar_id or not settings.google_service_account_json:
         logger.info("Google Calendar config is missing, skipping calendar check")
@@ -300,23 +357,33 @@ def _has_google_calendar_conflict(settings: Settings, target_day: date) -> bool:
     try:
         service = build("calendar", "v3", credentials=credentials, cache_discovery=False)
         response = (
-            service.events()
-            .list(
-                calendarId=settings.google_calendar_id,
-                timeMin=start_dt.isoformat(),
-                timeMax=end_dt.isoformat(),
-                singleEvents=True,
-                orderBy="startTime",
+            service.freebusy()
+            .query(
+                body={
+                    "timeMin": start_dt.isoformat(),
+                    "timeMax": end_dt.isoformat(),
+                    "timeZone": str(LOCAL_TZ),
+                    "items": [{"id": settings.google_calendar_id}],
+                }
             )
             .execute()
         )
     except HttpError as exc:
         raise ReservationAutomationError(f"Google Calendar API request failed: {exc}") from exc
 
-    for event in response.get("items", []):
-        if event.get("status") == "cancelled":
-            continue
-        logger.info("Calendar conflict found: %s", event.get("summary", "(no summary)"))
+    calendar_payload = response.get("calendars", {}).get(settings.google_calendar_id, {})
+    busy_slots = calendar_payload.get("busy", [])
+    qualifying_busy_slots = [
+        slot
+        for slot in busy_slots
+        if _busy_slot_overlaps_conflict_window(slot, target_day=target_day)
+    ]
+    if qualifying_busy_slots:
+        logger.info(
+            "Calendar conflict found: %s busy slot(s) overlapping %s or later",
+            len(qualifying_busy_slots),
+            CALENDAR_CONFLICT_START_TIME.strftime("%H:%M"),
+        )
         return True
     return False
 

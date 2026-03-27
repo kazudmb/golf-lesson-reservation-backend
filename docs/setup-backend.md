@@ -6,4 +6,4 @@
   - `PRODUCT`: `<project>`
   - `AWS_REGION`: `ap-northeast-1`
 - AWS Secrets Manager に保存
-  - `auto-reserve-lesson/credentials`: `{"LESSON_MEMBER_ID":"...","LESSON_PASSWORD":"..."}`
+  - `auto-reserve-lesson/credentials`: `{"LESSON_MEMBER_ID":"...","LESSON_PASSWORD":"...","GOOGLE_CALENDAR_ID":"...","GOOGLE_SERVICE_ACCOUNT_JSON":"..."}`

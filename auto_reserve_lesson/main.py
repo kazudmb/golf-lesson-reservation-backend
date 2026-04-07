@@ -920,8 +920,10 @@ class ReservationAutomation:
     def run(self, *, now: datetime) -> dict[str, Any]:
         now_local = now.astimezone(LOCAL_TZ)
         today = now_local.date()
+        logger.info("Starting reservation automation for %s at %s", today.isoformat(), now_local.isoformat())
 
         if not _time_is_in_window(now_local, self.settings):
+            logger.info("Skipping reservation automation: outside polling window at %s", now_local.isoformat())
             return {
                 "status": "skipped",
                 "reason": "outside_polling_window",
@@ -929,6 +931,7 @@ class ReservationAutomation:
             }
 
         if not _can_reserve_on(today):
+            logger.info("Skipping reservation automation: %s is not a reservable weekday", today.isoformat())
             return {
                 "status": "skipped",
                 "reason": "weekend_non_holiday",
@@ -936,6 +939,7 @@ class ReservationAutomation:
             }
 
         if _has_google_calendar_conflict(self.settings, today):
+            logger.info("Skipping reservation automation: Google Calendar conflict detected for %s", today.isoformat())
             return {
                 "status": "skipped",
                 "reason": "google_calendar_conflict",
@@ -951,6 +955,7 @@ class ReservationAutomation:
         existing_reservations = self.client.get_existing_reservations(reservation_page, base_date=today)
 
         if any(entry.reserved_date == today for entry in existing_reservations):
+            logger.info("Skipping reservation automation: reservation already exists for %s", today.isoformat())
             return {
                 "status": "skipped",
                 "reason": "already_reserved_today",
@@ -963,6 +968,11 @@ class ReservationAutomation:
 
         available_slots = self.client.find_available_slots(booking_page, target_day=today)
         if not available_slots:
+            logger.info(
+                "No available slots found for %s after %s",
+                today.isoformat(),
+                self.settings.min_slot_time.strftime("%H:%M"),
+            )
             return {
                 "status": "skipped",
                 "reason": "no_available_slot",
@@ -971,6 +981,13 @@ class ReservationAutomation:
             }
 
         chosen_slot = available_slots[0]
+        logger.info(
+            "Found %s available slot(s) for %s, choosing %s with availability %s",
+            len(available_slots),
+            today.isoformat(),
+            chosen_slot.reserved_time.strftime("%H:%M"),
+            chosen_slot.available_count,
+        )
 
         cancellations: list[str] = []
         future_reservations = [
@@ -983,6 +1000,10 @@ class ReservationAutomation:
         ]
 
         if non_cancellable_future:
+            logger.info(
+                "Skipping reservation automation: %s future reservation(s) cannot be cancelled",
+                len(non_cancellable_future),
+            )
             return {
                 "status": "skipped",
                 "reason": "future_reservation_without_cancel_action",
@@ -1002,6 +1023,14 @@ class ReservationAutomation:
 
         completed_text = _clean_text(completed_page.soup.get_text(" ", strip=True))
         is_completed = any(keyword in completed_text for keyword in ["予約完了", "予約を受け付けました", "予約が完了"])
+        logger.info(
+            "Reservation flow finished for %s: status=%s, slot=%s, cancelled=%s, confirmationDetected=%s",
+            today.isoformat(),
+            "reserved" if is_completed else "submitted",
+            chosen_slot.reserved_time.strftime("%H:%M"),
+            len(cancellations),
+            is_completed,
+        )
 
         return {
             "status": "reserved" if is_completed else "submitted",
